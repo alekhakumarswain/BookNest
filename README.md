@@ -1,139 +1,298 @@
 # BookNest 📚🏠
 
-**BookNest** is a modern, full-stack personal library management and collaborative reading platform. Designed for book enthusiasts, BookNest lets users organize their personal book collections by reading status (`Want to Read`, `Reading`, `Finished`), track reading progress page-by-page, curate custom shelves, share shelves with collaborators under granular Role-Based Access Control (RBAC), safely lend books to platform users without double-lending, and receive real-time updates via WebSockets.
+> A collaborative personal library management platform engineered with FastAPI, MongoDB, Next.js 14, and real-time WebSockets.
 
 ---
 
-## 🚀 How to Run (Clean-Clone Tested)
+## 1. Overview
 
-### Prerequisites
-- **Node.js**: v18.0.0 or higher
-- **Python**: v3.11 or higher
-- **MongoDB**: Local MongoDB instance (`mongodb://localhost:27017`) or a MongoDB Atlas URI
+**BookNest** is a full-stack platform designed for book enthusiasts to manage personal library collections, track page-by-page reading progress, organize custom shelves, share shelves with collaborators under granular Role-Based Access Control (RBAC), lend books safely without race conditions or double-lending, and receive instant updates across active user sessions via scoped WebSockets.
 
-### Step 1: Clone Repository
-```bash
-git clone https://github.com/alekhakumarswain/BookNest.git
-cd BookNest
+Rather than treating library management as simple CRUD operations, BookNest approaches the domain through **system design constraints**, enforcing strict ownership boundaries, server-side data invariants, multi-tenant RBAC dependencies, and event-level authorization.
+
+---
+
+## 2. 🧠 Engineering Approach & System Design
+
+### 2.1 Requirement Decomposition
+
+Before writing implementation code, the system requirements were decomposed into five structural layers:
+
+1. **User-Owned vs. Shared State**:
+   - *User-Owned State*: Books and Shelves belong to a specific `owner_id`. A user has default full authority over their owned entities.
+   - *Shared State*: Shelves can be shared with other users via `shelf_shares` records. Shared books inherit read/write permissions based on explicit collaborator roles (`editor`, `viewer`).
+2. **Cross-User Operations**:
+   - Lending books requires linking two distinct user identities (`lender_id` and `borrower_id`) without granting the borrower write access to the owner's book properties (title, notes, status).
+3. **State Transitions**:
+   - Book status progression (`Want to Read` → `Reading` → `Finished`) is governed by validation rules rather than arbitrary manual input.
+4. **Operations Requiring Database-Level Guarantees**:
+   - Guaranteeing that a book cannot be lent to multiple borrowers concurrently requires database-level unique constraints, not merely application-level checking.
+5. **Operations Requiring Real-Time Propagation**:
+   - Actions affecting shared resources (adding a book to a shared shelf, altering collaborator roles, lending or returning a book) require targeted real-time event dispatching without leaking events to unconcerned users.
+
+---
+
+### 2.2 Core Domain Invariants
+
+The architecture enforces strict invariants across all domain models:
+
+```text
+User-owned data
+└── User can only mutate resources they explicitly own.
+
+Shared shelf
+├── Owner → Full control (modify shelf metadata, add/remove books, manage roles, delete shelf).
+├── Editor → Modify books on shelf (add/remove books). Cannot manage shelf access or delete shelf.
+└── Viewer → Read-only access to shelf and contained books. Cannot alter shelf content.
+
+Lending
+├── Target book must exist in DB.
+├── Target book must belong to the lending user (owner_id == lender_id).
+├── Borrower cannot be the owner (borrower_id != lender_id).
+└── One active lending per book (guaranteed by UNIQUE database constraint on lendings.book_id).
+
+Reading progress
+├── current_page >= 0
+├── current_page <= total_pages
+├── total_pages must be set (> 0) before logging progress
+└── current_page == total_pages → Triggers automatic transition to 'Finished' with finished_date.
 ```
 
-### Step 2: Backend Setup
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-2. Create and activate a virtual environment:
-   - **Windows (PowerShell)**:
-     ```powershell
-     python -m venv venv
-     .\venv\Scripts\activate
-     ```
-   - **Linux / macOS**:
-     ```bash
-     python3 -m venv venv
-     source venv/bin/activate
-     ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Environment Configuration:
-   Create a `.env` file in the `backend` directory (or copy from `.env.example`):
-   ```env
-   MONGODB_URI=mongodb://localhost:27017
-   DB_NAME=booknest
-   JWT_SECRET=super-secret-access-key-booknest-2026-change-in-production
-   JWT_REFRESH_SECRET=super-secret-refresh-key-booknest-2026-change-in-production
-   ACCESS_TOKEN_EXPIRE_MINUTES=15
-   REFRESH_TOKEN_EXPIRE_DAYS=7
-   CORS_ORIGINS=http://localhost:3000
-   ```
-5. *(Optional)* Seed initial demo data:
-   ```bash
-   python seed.py
-   ```
-6. Start the FastAPI backend server:
-   ```bash
-   python run.py
-   ```
-   *The API server will run at `http://localhost:8000` with interactive API docs available at `http://localhost:8000/docs`.*
+---
 
-### Step 3: Frontend Setup
-1. Open a new terminal tab/window and navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Environment Configuration:
-   Create a `.env.local` file in the `frontend` directory (or copy from `.env.local.example`):
-   ```env
-   NEXT_PUBLIC_API_URL=http://localhost:8000
-   NEXT_PUBLIC_WS_URL=ws://localhost:8000
-   ```
-4. Start the Next.js development server:
-   ```bash
-   npm run dev
-   ```
-5. Open your browser and navigate to `http://localhost:3000`.
+### 2.3 State Transitions
+
+Book state is governed by a formal state machine:
+
+```text
+                  ┌────────────────┐
+                  │  Want to Read  │
+                  └───────┬────────┘
+                          │
+                          │ start reading / set current_page > 0
+                          ▼
+                  ┌────────────────┐
+                  │    Reading     │
+                  └───────┬────────┘
+                          │
+                          │ current_page == total_pages (validated)
+                          ▼
+                  ┌────────────────┐
+                  │    Finished    │
+                  └────────────────┘
+```
+
+> **Design Principle**: `Finished` is not merely a dropdown selection on the frontend. It is a **derived state transition** triggered by validated page progress. When `current_page` reaches `total_pages`, the backend automatically updates the status to `Finished` and sets `finished_date = now()`.
 
 ---
 
-## 📊 Data Model & Entity Relationships
+### 2.4 Authorization Model
 
-BookNest relies on a clean MongoDB document model with strict indexes for data integrity.
+Shelf access permissions follow a strict Role-Based Access Control (RBAC) matrix:
 
-### Database Collections
+| Operation | Owner | Editor | Viewer | Non-Collaborator |
+| :--- | :---: | :---: | :---: | :---: |
+| View shelf & contained books | ✅ | ✅ | ✅ | ❌ (403) |
+| Add book to shelf | ✅ | ✅ | ❌ (403) | ❌ (403) |
+| Remove book from shelf | ✅ | ✅ | ❌ (403) | ❌ (403) |
+| Rename / edit shelf details | ✅ | ❌ (403) | ❌ (403) | ❌ (403) |
+| Share shelf with new user | ✅ | ❌ (403) | ❌ (403) | ❌ (403) |
+| Modify collaborator role | ✅ | ❌ (403) | ❌ (403) | ❌ (403) |
+| Revoke collaborator | ✅ | ❌ (403) | ❌ (403) | ❌ (403) |
+| Delete shelf | ✅ | ❌ (403) | ❌ (403) | ❌ (403) |
+
+> **Security Mandate**: The frontend uses this authorization matrix to render appropriate UI controls, but **the backend independently enforces every authorization check on every request**. UI visibility is treated purely as a user experience convenience—never as a security boundary.
+
+---
+
+### 2.5 Consistency & Concurrency Strategy
+
+Preventing race conditions (such as double-lending a book during near-simultaneous user requests) highlights the difference between naive application checks and database-backed invariants:
+
+#### Naive Application Check (Vulnerable to Race Conditions):
+```text
+Client A ──► Read: Is book lent? (False) ──────┐
+                                              ├──► Insert Lending A & Lending B (RACE CONDITION!)
+Client B ──► Read: Is book lent? (False) ──────┘
+```
+
+#### Database Invariant (BookNest Implementation):
+```text
+Database Index: UNIQUE(lendings.book_id)
+
+Client A ──► Attempt Insert Lending A ──► Success (DB Lock)
+Client B ──► Attempt Insert Lending B ──► Duplicate Key Error (Code 11000) ──► Returned 400 Bad Request
+```
+
+Because two concurrent API requests can both observe `book is available` before either completes insertion, **the database unique index is the final authority on concurrency**.
+
+---
+
+### 2.6 Real-Time Event Model
+
+Rather than utilizing a global broadcast model (which risks leaking sensitive user actions or shared shelf updates to unconcerned users), BookNest implements **targeted, authorization-scoped event delivery**:
+
+```text
+                                  WebSocket Gateway
+                                         │
+                    ┌────────────────────┴────────────────────┐
+                    ▼                                         ▼
+           User-Scoped Events                       Shelf-Scoped Events
+                   │                                         │
+     Targeted to lender / borrower             Targeted to owner & collaborators
+                   │                                         │
+                   ▼                                         ▼
+         User Room Delivery                         Shelf Room Delivery
+```
+
+> **Design Principle**: I intentionally avoided a global broadcast model because **authorization applies to event delivery just as strictly as REST API endpoints**.
+
+---
+
+## 3. System Architecture
+
+```text
++-----------------------------------------------------------------------+
+|                          Next.js 14 Frontend                          |
+|  - React 19 / TypeScript / Tailwind CSS / Lucide Icons                |
+|  - Axios API Client + Silent JWT Refresh Interceptor                  |
+|  - WebSocket Context Listener with Auto-Reconnection                  |
++-----------------------------------+-----------------------------------+
+                                    |
+                    HTTP / REST     |      WebSockets (WSS)
+                                    v
++-----------------------------------+-----------------------------------+
+|                     Python (FastAPI) Backend                          |
+|  - Python 3.11+ / FastAPI / Pydantic v2 / Uvicorn                     |
+|  - JWT Auth + Passlib (bcrypt) + Dependency Injection                 |
+|  - Motor Async Driver for MongoDB                                     |
+|  - Targeted ConnectionManager Room Broadcaster                       |
++-----------------------------------+-----------------------------------+
+                                    |
+                                    v
++-----------------------------------------------------------------------+
+|                         MongoDB Database                              |
+|  - Collections: users, refresh_tokens, books, shelves,                |
+|    shelf_shares, lendings, activity_logs                              |
+|  - Indexes: Unique email, unique refresh token, unique lending book_id |
++-----------------------------------------------------------------------+
+```
+
+---
+
+## 4. 🔎 Requirement → Design Mapping
+
+This table details how system requirements directly dictated backend architectural design decisions and database constraints:
+
+| System Requirement | Backend Design Decision | Architectural Rationale |
+| :--- | :--- | :--- |
+| **User Data Isolation** | `owner_id` indexing on `books` and `shelves` | Enables zero-trust ownership checks on all single-tenant endpoints. |
+| **Many-to-Many Shelving** | `book_ids` array references on `shelves` | Allows a single book to belong to multiple custom shelves without duplication. |
+| **Collaborative Access** | Decoupled `shelf_shares` collection | Separates shelf ownership from collaborator memberships and role grants. |
+| **Granular RBAC** | `get_shelf_user_role` resolution dependency | Centralizes permission checks (`owner`, `editor`, `viewer`) before executing mutations. |
+| **Single Active Borrower** | Unique MongoDB index on `lendings.book_id` | Enforces database-level concurrency protection against double-lending race conditions. |
+| **Reading Completion** | Progress validator + auto state trigger | Ensures status consistency (`Finished`) based on validated page counts (`current_page == total_pages`). |
+| **Revocable Authentication** | DB-backed `refresh_tokens` + HTTP-only cookie | Provides server-side session revocation while protecting long-lived credentials from XSS. |
+| **Live Lending Updates** | User-scoped WebSocket rooms (`user:<id>`) | Delivers real-time notifications strictly to the lender and borrower involved. |
+| **Live Collaborative Updates** | Collaborator-scoped WebSocket distribution | Prevents event leakage by resolving shelf shares before broadcasting shelf mutations. |
+| **Audit Log History** | Persistent `activity_logs` collection | Supports historical activity queries while feeding live dashboard feeds. |
+
+---
+
+## 5. Data Model & Entity Relationships
+
+### 5.1 MongoDB Collections Schema
 
 1. **`users`**: Platform user accounts.
-   - `id` (`ObjectId`), `name`, `email` *(Unique Index)*, `password_hash`, `created_at`, `updated_at`
-2. **`refresh_tokens`**: Active long-lived refresh tokens.
-   - `id` (`ObjectId`), `token` *(Unique Index)*, `user_id`, `expires_at` *(TTL Index)*, `created_at`
-3. **`books`**: Personal library items.
-   - `id` (`ObjectId`), `owner_id`, `title`, `author`, `status` (`Want to Read` | `Reading` | `Finished`), `total_pages`, `current_page`, `rating`, `notes`, `finished_date`, timestamps
-4. **`shelves`**: Custom book collections.
-   - `id` (`ObjectId`), `owner_id`, `name`, `description`, `book_ids` *(Array of book.id references)*, timestamps
-5. **`shelf_shares`**: Collaborator access permissions.
-   - `id` (`ObjectId`), `shelf_id`, `user_id`, `role` (`editor` | `viewer`) *(Unique compound index on shelf_id + user_id)*, `created_at`
-6. **`lendings`**: Active book lending records.
-   - `id` (`ObjectId`), `book_id` *(Unique Index enforcing single-borrower)*, `lender_id`, `borrower_id`, `borrowed_at`
-7. **`activity_logs`**: System audit trail & user notifications.
-   - `id` (`ObjectId`), `user_id`, `action`, `details`, `metadata`, `created_at`
+   - `_id`: `ObjectId`
+   - `name`: `str`
+   - `email`: `str` *(Unique Index)*
+   - `password_hash`: `str`
+   - `created_at`, `updated_at`: `datetime`
 
-### Entity Relationship Diagram
+2. **`refresh_tokens`**: Active refresh tokens for session management.
+   - `_id`: `ObjectId`
+   - `token`: `str` *(Unique Index)*
+   - `user_id`: `str` *(References users._id)*
+   - `expires_at`: `datetime` *(TTL Index)*
+   - `created_at`: `datetime`
+
+3. **`books`**: Personal library items.
+   - `_id`: `ObjectId`
+   - `owner_id`: `str` *(References users._id)*
+   - `title`: `str`
+   - `author`: `str`
+   - `status`: `str` (`Want to Read`, `Reading`, `Finished`)
+   - `total_pages`: `int`
+   - `current_page`: `int`
+   - `rating`: `Optional[int]` (1 to 5)
+   - `notes`: `Optional[str]`
+   - `finished_date`: `Optional[datetime]`
+   - `created_at`, `updated_at`: `datetime`
+
+4. **`shelves`**: Custom book groupings.
+   - `_id`: `ObjectId`
+   - `owner_id`: `str` *(References users._id)*
+   - `name`: `str`
+   - `description`: `Optional[str]`
+   - `book_ids`: `List[str]` *(Array of books._id string references)*
+   - `created_at`, `updated_at`: `datetime`
+
+5. **`shelf_shares`**: Collaborator access grants.
+   - `_id`: `ObjectId`
+   - `shelf_id`: `str` *(References shelves._id)*
+   - `user_id`: `str` *(References users._id)*
+   - `role`: `str` (`editor`, `viewer`)
+   - `created_at`: `datetime`
+   - *Compound Unique Index*: `(shelf_id, user_id)`
+
+6. **`lendings`**: Active book lending agreements.
+   - `_id`: `ObjectId`
+   - `book_id`: `str` *(Unique Index — enforces single active borrower)*
+   - `lender_id`: `str` *(References users._id)*
+   - `borrower_id`: `str` *(References users._id)*
+   - `borrowed_at`: `datetime`
+
+7. **`activity_logs`**: System audit records.
+   - `_id`: `ObjectId`
+   - `user_id`: `str` *(Target user)*
+   - `action`: `str` (`BOOK_ADDED`, `SHELF_SHARED`, `BOOK_LENT`, etc.)
+   - `details`: `str`
+   - `metadata`: `Optional[dict]`
+   - `created_at`: `datetime`
+
+### 5.2 Entity Relationship Diagram
 
 ```mermaid
 erDiagram
-    USER ||--o{ BOOK : "owns"
-    USER ||--o{ SHELF : "creates"
-    USER ||--o{ SHELF_SHARE : "collaborates"
+    USER ||--o{ BOOK : "owns (owner_id)"
+    USER ||--o{ SHELF : "creates (owner_id)"
+    USER ||--o{ SHELF_SHARE : "granted access (user_id)"
     USER ||--o{ LENDING : "lends/borrows"
-    SHELF ||--o{ SHELF_SHARE : "has shares"
-    SHELF }|--|{ BOOK : "contains (book_ids)"
-    BOOK ||--o| LENDING : "lent via (single borrower)"
     USER ||--o{ REFRESH_TOKEN : "authenticates"
+    SHELF ||--o{ SHELF_SHARE : "shared via (shelf_id)"
+    SHELF }|--|{ BOOK : "references (book_ids)"
+    BOOK ||--o| LENDING : "lent through (unique book_id)"
 ```
 
 ---
 
-## 🛠️ Stack Choice & Rationale
+## 6. API / Backend Architecture
 
-| Layer | Technology | Rationale |
-| :--- | :--- | :--- |
-| **Frontend Framework** | **Next.js 14+ (App Router) / React 19** | Fast Server-Side Rendering (SSR), intuitive file-system routing, component-driven UI architecture, and TypeScript type safety. |
-| **Backend Framework** | **Python 3.11+ & FastAPI** | High-performance asynchronous I/O, native Pydantic v2 data validation, OpenAPI documentation generation, and native WebSocket support. |
-| **Database & Driver** | **MongoDB + Motor (Async Driver)** | Flexible JSON document store, fast queries with compound indexes, and natural handling of embedded array relationships (`book_ids`). |
-| **Authentication** | **JWT (PyJWT) + Passlib (bcrypt)** | Stateless access token verification paired with secure, database-backed HTTP-only refresh token rotation. |
-| **Real-time Engine** | **FastAPI WebSockets** | Lightweight, direct WebSocket communication without third-party external server overhead. |
-| **Styling & Icons** | **Tailwind CSS + Lucide Icons** | Glassmorphism aesthetics, responsive layouts, and consistent visual hierarchy. |
+The backend is organized into modular FastAPI routers in [`backend/app/routers/`](file:///f:/Projects/BookNest/backend/app/routers/):
+
+- [`auth.py`](file:///f:/Projects/BookNest/backend/app/routers/auth.py): User registration, login, token refresh, logout, profile retrieval.
+- [`books.py`](file:///f:/Projects/BookNest/backend/app/routers/books.py): CRUD operations, pagination, text search, filtering, reading progress updates.
+- [`shelves.py`](file:///f:/Projects/BookNest/backend/app/routers/shelves.py): Shelf management, collaborator sharing, role management, book assignment.
+- [`lending.py`](file:///f:/Projects/BookNest/backend/app/routers/lending.py): Book lending, active loan tracking, return operations.
+- [`dashboard.py`](file:///f:/Projects/BookNest/backend/app/routers/dashboard.py): Metric aggregations, statistics.
+- [`activity.py`](file:///f:/Projects/BookNest/backend/app/routers/activity.py): Activity log retrieval.
 
 ---
 
-## 🔐 Refresh Token Lifecycle & Auth Flow
+## 7. Authentication & Token Lifecycle
 
-BookNest implements a hybrid JWT authentication strategy designed to protect against Cross-Site Scripting (XSS) and token theft.
+BookNest implements a defensible dual-token authentication scheme:
 
 ```
 +---------------+                +-------------------+                +-------------------+
@@ -141,58 +300,52 @@ BookNest implements a hybrid JWT authentication strategy designed to protect aga
 +-------+-------+                +---------+---------+                +---------+---------+
         |                                  |                                    |
         | 1. POST /api/auth/login          |                                    |
-        |--------------------------------->| Verify credentials                 |
-        |                                  | Save Refresh Token                |
+        |--------------------------------->| Verify Password (Bcrypt)           |
+        |                                  | Insert Refresh Token               |
         |                                  |----------------------------------->|
         | 2. Returns Access Token (JSON)   |                                    |
         |    + Set HTTP-only Cookie        |                                    |
         |<---------------------------------|                                    |
         |                                  |                                    |
-        | 3. Request API (Bearer token)    |                                    |
-        |--------------------------------->| Validates Access Token             |
-        | 4. Token Expired (401 error)     |                                    |
+        | 3. Request API (Bearer Header)   |                                    |
+        |--------------------------------->| Verify JWT Signature & Expiry      |
+        | 4. HTTP 401 (ACCESS_TOKEN_EXPIRED)|                                   |
         |<---------------------------------|                                    |
         |                                  |                                    |
         | 5. Silent POST /api/auth/refresh |                                    |
-        |    (Cookie attached automatically)| Verify in DB & Issue new tokens    |
+        |    (Cookie attached automatically)| Verify Token in DB & Expiry       |
         |--------------------------------->|----------------------------------->|
-        | 6. New Access Token returned     |                                    |
+        | 6. Return new Access Token       |                                    |
         |<---------------------------------|                                    |
         | 7. Retry Original Request        |                                    |
         |--------------------------------->| Request succeeds!                  |
 ```
 
-- **Access Token**: Short-lived (15 minutes). Stored in client memory / `localStorage` and attached to outgoing requests in the `Authorization: Bearer <token>` header.
-- **Refresh Token**: Long-lived (7 days). Stored in the MongoDB `refresh_tokens` collection and issued to the client as an `httpOnly`, `SameSite=Lax`, `Path=/api/auth` HTTP cookie (inaccessible to JavaScript).
-- **Silent Refresh Interceptor**: When an access token expires, the frontend Axios response interceptor catches the `401 Unauthorized` response (`ACCESS_TOKEN_EXPIRED`), issues a request to `/api/auth/refresh`, updates the stored access token, and transparently retries the original request without user interruption.
-- **Revocation / Expiry**: On logout or refresh token expiry, the token record is removed from MongoDB and the cookie is cleared.
+### Technical Defense of Token Strategy
+- **Refresh Token Storage**: The refresh token is stored in a database collection (`refresh_tokens`) and delivered in an `httpOnly`, `SameSite=Lax`, `Path=/api/auth` cookie. JavaScript cannot access this cookie, defending long-lived credentials against XSS theft while providing server-side session revocation capabilities.
+- **Access Token Storage**: The short-lived (15 minutes) access token is held in client memory and `localStorage`, sent via the `Authorization: Bearer <token>` header. If an access token is compromised, its lifetime is capped at 15 minutes.
+- **Axios Silent Refresh Interceptor**: Requests failing with `401 Unauthorized` automatically enter a queue in [`frontend/lib/api.ts`](file:///f:/Projects/BookNest/frontend/lib/api.ts). A single `/api/auth/refresh` call fetches a new access token, updates default headers, and re-executes all queued requests transparently.
 
 ---
 
-## 🛡️ Enforcing Granular Shelf Roles (RBAC)
+## 8. RBAC & Authorization Enforcement
 
-Shared shelves support three explicit roles:
-1. **Owner**: The shelf creator. Full privileges: edit name/description, delete shelf, add/remove books, share shelf, assign roles, and revoke collaborators.
-2. **Editor**: Collaborator with write access to books. Can add and remove books from the shelf. Cannot rename/delete the shelf or manage collaborators.
-3. **Viewer**: Collaborator with read-only access. Can view the shelf and books. Cannot make modifications.
-
-### Backend Role Enforcement & Preventing Viewer API Bypasses
-
-Role enforcement is executed on every backend endpoint using the `get_shelf_user_role(db, shelf_id, user_id)` helper:
+Role evaluation is centralized in [`backend/app/routers/shelves.py`](file:///f:/Projects/BookNest/backend/app/routers/shelves.py) via `get_shelf_user_role`:
 
 ```python
 async def get_shelf_user_role(db, shelf_id: str, user_id: str) -> Optional[str]:
+    if not ObjectId.is_valid(shelf_id):
+        return None
     shelf = await db.shelves.find_one({"_id": ObjectId(shelf_id)})
     if not shelf:
         return None
     if str(shelf["owner_id"]) == user_id:
         return "owner"
-    
     share = await db.shelf_shares.find_one({"shelf_id": shelf_id, "user_id": user_id})
     return share["role"] if share else None
 ```
 
-If a **Viewer** attempts to bypass the UI and issue a direct REST request (e.g., `POST /api/shelves/{shelf_id}/books?book_id=123`), the endpoint verifies the role before writing to MongoDB:
+Every mutating endpoint executes strict role checks. For instance, when adding a book to a shelf:
 
 ```python
 role = await get_shelf_user_role(db, shelf_id, current_user["id"])
@@ -202,56 +355,170 @@ if role not in ["owner", "editor"]:
         detail="Only shelf owners and editors can add books to this shelf"
     )
 ```
-Direct API calls by unauthorized roles are immediately rejected with **HTTP 403 Forbidden**.
+
+Direct REST requests sent by a **Viewer** bypass frontend UI restrictions but are immediately caught by the backend dependency and rejected with **HTTP 403 Forbidden**.
 
 ---
 
-## ⚡ Real-Time WebSocket Architecture
+## 9. Reading Progress State Management
 
-BookNest uses FastAPI WebSockets to deliver instantaneous UI updates across users.
+Reading progress validation is implemented in [`backend/app/routers/books.py`](file:///f:/Projects/BookNest/backend/app/routers/books.py):
 
-### Handshake & Authentication
-WebSockets connect via `ws://localhost:8000/api/ws?token=<JWT_ACCESS_TOKEN>`. The backend validates the JWT during the handshake (`decode_access_token`). Sockets with missing or expired tokens are rejected immediately (`close(code=4001)`).
-
-### Targeted Event Scoping (No Global Broadcasts)
-The backend `ConnectionManager` maps active connections by `user_id`:
-- **User Scoped Events**: When a book is lent or returned, WebSocket messages are sent exclusively to the lender and borrower's connection sets (`user:<user_id>`).
-- **Shelf Scoped Events**: When a book is added to or removed from a shared shelf, `log_activity` identifies all collaborators (`owner_id` + `user_id`s in `shelf_shares`) and broadcasts the event directly to those specific users.
-
-### Disconnects & Reconnects
-- **Keep-Alive Ping**: The frontend sends a `{ "action": "ping" }` message every 25 seconds to keep the socket alive through proxies.
-- **Auto-Reconnection**: If connection drops, the `WebSocketProvider` catches the `onclose` event and automatically attempts reconnection after 3 seconds, maintaining seamless state upon connection recovery.
+- **Constraint Validation**:
+  - `current_page < 0`: Rejects with `400 Bad Request` ("Current page cannot be negative").
+  - `current_page > total_pages`: Rejects with `400 Bad Request` ("Current page cannot exceed total pages").
+  - `total_pages <= 0`: Rejects progress updates until total page count is configured.
+- **State Transition Trigger**:
+  - When `current_page == total_pages`, the backend sets `status = "Finished"` and stamps `finished_date = datetime.now(timezone.utc)`.
 
 ---
 
-## 💡 Engineering Challenges & Solutions
+## 10. Lending & Concurrency Control
 
-1. **Race Conditions in Concurrent Silent Token Refresh**:
-   - *Problem*: When a page loaded 5 requests simultaneously with an expired access token, all 5 failed with `401`, triggering 5 parallel refresh requests.
-   - *Solution*: Implemented an Axios queueing mechanism (`failedQueue`) in [`frontend/lib/api.ts`](file:///f:/Projects/BookNest/frontend/lib/api.ts). The first 401 sets `isRefreshing = true` and triggers `/api/auth/refresh`, while subsequent failing requests return a Promise stored in `failedQueue`. Once refreshed, the queue resolves and retries all original requests cleanly.
-2. **Preventing Double-Lending in MongoDB**:
-   - *Problem*: Without native SQL foreign key constraints, concurrent lending requests could result in a book being lent to two borrowers simultaneously.
-   - *Solution*: Created a unique database index on `lendings.book_id` in MongoDB. Attempting to insert a duplicate lending record fails at the database layer with a code 11000 duplicate key error, which FastAPI handles gracefully as an HTTP 400 validation error.
+Lending logic in [`backend/app/routers/lending.py`](file:///f:/Projects/BookNest/backend/app/routers/lending.py) enforces four explicit safety rules:
 
----
-
-## ⚠️ Known Issues & Limitations
-
-- **Email Notifications**: Activity events trigger in-app WebSocket notifications; transactional email notifications (e.g. SMTP/SendGrid) are currently not configured.
-- **Custom Image File Uploads**: Books render styled UI covers; custom image uploads to S3/Cloudinary are not currently included.
+1. **Ownership**: The lender must own the target book (`owner_id == lender_id`).
+2. **Self-Lending Prevention**: A user cannot lend a book to themselves (`borrower_id != lender_id`).
+3. **Single Active Borrower**: Handled at the database level. The `lendings` collection enforces `unique=True` on `book_id`. If two requests attempt to lend the same book concurrently, MongoDB rejects the second insert with a duplicate key error, preventing race conditions.
+4. **Return Control**: Only the book owner can mark a lent book as returned, which deletes the lending record and restores single-owner authority.
 
 ---
 
-## 🔮 Future Improvements
+## 11. WebSocket Architecture
 
-- **Open Library API Integration**: Automatic metadata lookup by ISBN to autofill title, author, total pages, and cover artwork.
-- **Offline PWA Support**: Service Worker caching with IndexedDB for reading progress logging offline.
-- **Analytics & Reading Streaks**: Expanded dashboard visualizations for yearly reading goals, pages read per day, and reading velocity charts.
+Real-time communications are managed by `ConnectionManager` in [`backend/app/websocket.py`](file:///f:/Projects/BookNest/backend/app/websocket.py):
+
+- **Authentication Handshake**: Client connects via `ws://localhost:8000/api/ws?token=<JWT_ACCESS_TOKEN>`. The backend verifies the token using `decode_access_token`. Sockets with missing/invalid tokens are closed immediately (`code=4001`).
+- **User Connection Mapping**: `ConnectionManager` maps `user_id -> Set[WebSocket]`.
+- **Targeted Broadcasting**:
+  ```python
+  async def broadcast_to_user(self, user_id: str, message: dict):
+      if user_id in self.user_connections:
+          for connection in self.user_connections[user_id]:
+              await connection.send_json(message)
+  ```
+- **Disconnection & Heartbeat**: The client sends a `{ "action": "ping" }` frame every 25 seconds. If the socket closes, [`frontend/context/WebSocketContext.tsx`](file:///f:/Projects/BookNest/frontend/context/WebSocketContext.tsx) triggers an automatic reconnection after 3 seconds.
 
 ---
 
-## 🧠 AI Usage & Learnings
+## 12. Activity & Event Architecture
 
-- **UI System & Aesthetics**: AI was used to draft glassmorphism styling, curated color tokens, and responsive UI layouts in Tailwind CSS.
-- **Concurrency & Resilience Patterns**: Leveraged AI to refine Axios interceptor promise queues and WebSocket reconnection loops.
-- **Key Learnings**: Gained deep hands-on experience in building robust JWT refresh flows with HTTP-only cookies, enforcing multi-tenant RBAC in document databases, and scoping real-time WebSocket connection pools.
+Audit logging is driven by `log_activity` in [`backend/app/services/activity.py`](file:///f:/Projects/BookNest/backend/app/services/activity.py):
+
+When an action occurs (e.g. `BOOK_LENT`, `SHELF_BOOK_ADDED`), `log_activity`:
+1. Persists an `ActivityLogDocument` in the `activity_logs` collection.
+2. Resolves targeted user IDs (actor, borrower, or shelf collaborators).
+3. Dispatches a real-time WebSocket event directly to those targeted user connections.
+
+---
+
+## 13. Frontend State & UX Resilience
+
+The Next.js frontend in [`frontend/`](file:///f:/Projects/BookNest/frontend/) ensures a resilient user experience:
+
+- **Double-Submit Prevention**: Action buttons enter a disabled loading state while asynchronous API requests are pending.
+- **Inline Validation**: Input fields validate formats (email pattern, page limits, password policy) and render descriptive error messages inline without crashing the UI.
+- **Optimistic UI Updates**: Local state updates immediately on user interaction while verifying changes against backend responses.
+- **Loading & Error States**: Components display clean skeleton loaders during network fetches and user-friendly error banners with retry buttons upon request failures.
+
+---
+
+## 14. Stack Choice & Trade-offs
+
+| Choice | Advantages | Trade-offs & Mitigations |
+| :--- | :--- | :--- |
+| **FastAPI** | High async performance, automatic OpenAPI documentation, Pydantic type safety. | Lacks built-in ORM/admin UI; addressed by building modular Pydantic schemas and service layers. |
+| **MongoDB** | Flexible schema, fast document reads, natural representation of embedded arrays (`book_ids`). | Lacks native foreign key constraints; mitigated by creating explicit DB indexes (`unique=True` on `lendings.book_id`) and app-level cleanup cascades. |
+| **Next.js 14 App Router** | Server-side rendering, component modularity, clean TypeScript integration. | Increased client build complexity; managed through modular React Contexts (`AuthContext`, `WebSocketContext`). |
+| **Tailwind CSS** | Rapid utility-first styling, consistent design tokens, glassmorphism UI. | Requires strict component organization to avoid inline class clutter. |
+
+---
+
+## 15. Engineering Challenges & Solutions
+
+1. **Race Conditions in Concurrent Token Refresh**:
+   - *Challenge*: Simultaneous API requests failing with `401 Unauthorized` caused duplicate refresh token calls.
+   - *Solution*: Built an Axios request queue (`failedQueue`) in [`frontend/lib/api.ts`](file:///f:/Projects/BookNest/frontend/lib/api.ts) that pauses parallel requests, executes a single refresh operation, and retries all queued calls upon completion.
+2. **Preventing Double-Lending Concurrency Issues**:
+   - *Challenge*: Simultaneous lending requests for the same book could bypass application checks.
+   - *Solution*: Enforced a unique index on `lendings.book_id` in MongoDB, delegating atomicity to the database engine.
+3. **Scoped WebSocket Delivery**:
+   - *Challenge*: Preventing unauthorized event leakage across shared shelves.
+   - *Solution*: Designed a connection manager that maps sockets to user IDs and resolves collaborator lists before broadcasting shelf updates.
+
+---
+
+## 16. Security Considerations
+
+- **Password Hashing**: Passwords hashed using `bcrypt` (Passlib).
+- **Password Policy**: Minimum 8 characters, requiring uppercase, lowercase, numbers, and special characters.
+- **XSS & CSRF Mitigation**: Refresh tokens stored in `httpOnly` cookies with `SameSite=Lax`.
+- **Zero-Trust Backend**: Every API endpoint independently validates access tokens and ownership/RBAC roles.
+
+---
+
+## 17. Known Issues / Limitations
+
+- **Transactional Email**: Activity logs currently trigger real-time in-app WebSocket events; email sending via SMTP/SendGrid is not implemented.
+- **File Uploads**: Books feature generated visual UI covers; file storage integrations (S3/Cloudinary) are omitted.
+
+---
+
+## 18. Future Improvements
+
+- **Open Library API Integration**: Automatic metadata lookup by ISBN to fill title, author, total pages, and cover artwork.
+- **Offline PWA Capabilities**: Offline progress tracking backed by IndexedDB and Service Worker synchronization.
+- **Reading Analytics**: Visual graphs for monthly reading velocity, pages read per day, and annual reading goals.
+
+---
+
+## 19. AI Usage & Learnings
+
+- **UI & System Design**: Utilized AI to design glassmorphism theme tokens and draft TypeScript interfaces for RBAC and WebSocket context states.
+- **Resilience Engineering**: Used AI to refine Axios interceptor promise queues for silent refresh retries.
+- **Key Takeaway**: Gained deep practical insight into structuring hybrid JWT auth flows, enforcing RBAC boundaries in document databases, and scoping WebSocket event dispatchers.
+
+---
+
+## 20. Running Locally
+
+### Prerequisites
+- Node.js v18+
+- Python v3.11+
+- MongoDB instance (`mongodb://localhost:27017`)
+
+### 1. Backend Setup
+```bash
+cd backend
+python -m venv venv
+
+# Windows (PowerShell)
+.\venv\Scripts\activate
+# Linux/macOS
+source venv/bin/activate
+
+pip install -r requirements.txt
+cp .env.example .env
+python seed.py   # Optional: Seed demo data
+python run.py    # Runs on http://localhost:8000
+```
+
+### 2. Frontend Setup
+```bash
+cd frontend
+npm install
+cp .env.local.example .env.local
+npm run dev      # Runs on http://localhost:3000
+```
+
+---
+
+## 21. Assessment Coverage Checklist
+
+- [x] **User Auth & JWT Refresh Flow**: Access tokens (15m) + HTTP-only DB-backed refresh tokens (7d).
+- [x] **Book CRUD & Progress Engine**: Page tracking, auto-completion triggers (`Finished`), validation bounds.
+- [x] **Custom & Shared Shelves**: Many-to-many relationship, collaborator invitations.
+- [x] **Granular RBAC**: Owner, Editor, Viewer enforcement on backend endpoints.
+- [x] **Lending Engine**: Single active borrower rule backed by unique MongoDB indexes.
+- [x] **Real-Time WebSockets**: Targeted user and collaborator event delivery with auto-reconnect.
+- [x] **Activity Log**: Audit logging across all platform actions.
